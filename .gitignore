@@ -1,0 +1,12 @@
+# 本地抓取缓存（体积大，不入库）
+cache/
+__pycache__/
+*.pyc
+
+# 截图与临时产物
+*.png
+pkg/
+single.html
+
+# 系统文件
+.DS_Store
