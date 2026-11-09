@@ -797,10 +797,20 @@ def main():
                         int(round(b[2] * 100)), int(round(b[3] * 100))])
         if len(arr) >= 25:
             ksnap[r[0]] = arr
-    kf = os.path.join(OUT, "klines.json")
-    with open(kf, "w", encoding="utf-8") as f:
-        json.dump(ksnap, f, ensure_ascii=False, separators=(",", ":"))
-    print(f"[done] klines {len(ksnap)} -> {kf}", flush=True)
+    # 按代码尾号分 10 片输出：单片约 1.3MB，详情页按需只取一片
+    shards = {}
+    for code, arr in ksnap.items():
+        shards.setdefault(code[-1], {})[code] = arr
+    for d in range(10):
+        part = shards.get(str(d), {})
+        sf = os.path.join(OUT, f"klines_{d}.json")
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump(part, f, ensure_ascii=False, separators=(",", ":"))
+    legacy = os.path.join(OUT, "klines.json")
+    if os.path.exists(legacy):
+        os.remove(legacy)
+    print(f"[done] klines {len(ksnap)} -> 10 shards, sizes="
+          + ",".join(str(len(shards.get(str(d), {}))) for d in range(10)), flush=True)
     print(f"[macro] 10Y={macro['y10']} ({macro['y10_date']}) z={macro['y10_z']}", flush=True)
 
 
