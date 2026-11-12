@@ -1,4 +1,4 @@
-name: 每日更新行情快照
+name: 每日更新行情快照并部署 Cloudflare Pages
 
 on:
   schedule:
@@ -9,8 +9,12 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: lowvol-daily
+  cancel-in-progress: false
+
 jobs:
-  update:
+  update-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -21,13 +25,44 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: 安装依赖
         run: pip install -r requirements.txt
 
       - name: 抓取全市场数据
         run: python fetch.py
 
-      - name: 提交快照
+      - name: 校验数据完整性
+        run: |
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("docs/data/full.json", encoding="utf-8"))
+          rows = d.get("rows") or d.get("items") or d.get("data") or []
+          n = len(rows)
+          print("rows =", n, "date =", d.get("date"), "universe =", d.get("universe"))
+          # 覆盖率闸门：低于 4500 只说明抓取被限流，直接失败，避免发布残缺数据
+          if n < 4500:
+              sys.exit("数据覆盖不足（%d 只），疑似接口限流，已阻止发布" % n)
+          PY
+
+      - name: 部署到 Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "缺少 CLOUDFLARE_API_TOKEN，请在仓库 Settings → Secrets 中配置"
+            exit 1
+          fi
+          npx --yes wrangler@latest pages deploy ./docs \
+            --project-name=lowvol-grid \
+            --branch=main \
+            --commit-dirty=true
+
+      - name: 提交快照到仓库
         run: |
           git config user.name  "lowvol-bot"
           git config user.email "lowvol-bot@users.noreply.github.com"
