@@ -1,10 +1,28 @@
 name: 每日更新行情快照并部署 Cloudflare Pages
 
+# ============================================================
+# 国内出口说明
+# ------------------------------------------------------------
+# GitHub Actions 的 runner 是境外（Azure）IP，东方财富列表接口对境外 IP
+# 按页限流，实测只能抓到 1400/5928（23.6%）。本工作流支持通过一条
+# 国内出口（HTTP/HTTPS 代理）抓数据：
+#
+#   仓库 Settings → Secrets and variables → Actions → New secret
+#   名称：CHINA_PROXY_URL
+#   值形如：http://user:pass@1.2.3.4:3128   或   socks5h://1.2.3.4:1080
+#
+# 未配置该 Secret 时：脚本仍然直连（海外 IP），大概率被限流后由
+# 覆盖率闸门拦截并 fail —— 不会污染线上数据。
+# ============================================================
+
 on:
   schedule:
-    # A 股 15:00 收盘，留 30 分钟等数据接口结算；UTC 08:30 = 北京时间 16:30
-    - cron: "30 8 * * 1-5"
-  workflow_dispatch:        # 支持手动触发
+    # A 股 15:00 收盘，留时间等接口结算。UTC 08:35 = 北京 16:35
+    - cron: "35 8 * * 1-5"
+    # 备用重试时段：万一第一次被限流，后续两次还有机会
+    - cron: "5 10 * * 1-5"    # 北京 18:05
+    - cron: "5 12 * * 1-5"    # 北京 20:05
+  workflow_dispatch:           # 支持手动触发
 
 permissions:
   contents: write
@@ -16,7 +34,7 @@ concurrency:
 jobs:
   update-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90          # 走代理后单页会变慢，放宽到 90 分钟
     steps:
       - uses: actions/checkout@v4
 
@@ -32,20 +50,56 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 检查出口网络
+        env:
+          CHINA_PROXY_URL: ${{ secrets.CHINA_PROXY_URL }}
+        run: |
+          set +e
+          if [ -n "$CHINA_PROXY_URL" ]; then
+            echo "已配置 CHINA_PROXY_URL，检测代理连通性…"
+            curl -s --max-time 25 -x "$CHINA_PROXY_URL" https://myip.ipip.net && echo || true
+            if ! curl -s --max-time 25 -o /dev/null -x "$CHINA_PROXY_URL" \
+                 "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=5&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6&fields=f12,f14"; then
+              echo "❌ 代理无法访问东方财富，请检查 CHINA_PROXY_URL 是否正确、是否仍有效"
+              exit 1
+            fi
+            echo "✅ 代理可访问东方财富"
+          else
+            echo "⚠️ 未配置 CHINA_PROXY_URL，将使用 runner 的境外 IP 直连"
+            echo "   东财列表接口对境外 IP 按页限流，很可能抓不全（会被覆盖率闸门拦截）"
+            curl -s --max-time 20 https://myip.ipip.net || true
+          fi
+
       - name: 抓取全市场数据
-        run: python fetch.py
+        env:
+          CHINA_PROXY_URL: ${{ secrets.CHINA_PROXY_URL }}
+        run: |
+          # 只在抓取这一步注入代理，避免影响后续 wrangler 部署
+          if [ -n "$CHINA_PROXY_URL" ]; then
+            echo "使用国内出口抓取：已隐藏凭据"
+            export HTTP_PROXY="$CHINA_PROXY_URL"
+            export HTTPS_PROXY="$CHINA_PROXY_URL"
+            export ALL_PROXY="$CHINA_PROXY_URL"
+            export http_proxy="$CHINA_PROXY_URL"
+            export https_proxy="$CHINA_PROXY_URL"
+          else
+            echo "未配置代理，直连抓取"
+          fi
+          python fetch.py
 
       - name: 校验数据完整性
         run: |
           python - <<'PY'
           import json, sys
           d = json.load(open("docs/data/full.json", encoding="utf-8"))
-          rows = d.get("rows") or d.get("items") or d.get("data") or []
+          meta = d.get("meta") or {}
+          rows = d.get("rows") or []
           n = len(rows)
-          print("rows =", n, "date =", d.get("date"), "universe =", d.get("universe"))
+          print("rows =", n, "| date =", meta.get("date"), "| universe =", meta.get("universe"))
           # 覆盖率闸门：低于 4500 只说明抓取被限流，直接失败，避免发布残缺数据
           if n < 4500:
               sys.exit("数据覆盖不足（%d 只），疑似接口限流，已阻止发布" % n)
+          print("覆盖完整，允许发布")
           PY
 
       - name: 部署到 Cloudflare Pages
@@ -57,7 +111,7 @@ jobs:
             echo "缺少 CLOUDFLARE_API_TOKEN，请在仓库 Settings → Secrets 中配置"
             exit 1
           fi
-          npx --yes wrangler@latest pages deploy ./docs \
+          npx --yes wrangler@3 pages deploy ./docs \
             --project-name=lowvol-grid \
             --branch=main \
             --commit-dirty=true
